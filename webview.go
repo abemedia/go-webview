@@ -110,9 +110,31 @@ func New(debug bool) WebView { return NewWindow(debug, nil) }
 // here.
 func NewWindow(debug bool, window unsafe.Pointer) WebView {
 	loadOnce.Do(func() {
-		load()
-		dispatchCallbackPtr = purego.NewCallback(dispatchCallback)
-		bindingCallbackPtr = purego.NewCallback(bindingCallback)
+		libHandle, err := loadLibrary(libraryPath())
+		if err != nil {
+			panic("webview: failed to load native library: " + err.Error())
+		}
+		if libHandle == 0 {
+			panic("webview: native library not loaded")
+		}
+		// Resolve all required symbols from the library
+		pCreate = loadSymbol(libHandle, "webview_create")
+		pDestroy = loadSymbol(libHandle, "webview_destroy")
+		pRun = loadSymbol(libHandle, "webview_run")
+		pTerminate = loadSymbol(libHandle, "webview_terminate")
+		pDispatch = loadSymbol(libHandle, "webview_dispatch")
+		pGetWindow = loadSymbol(libHandle, "webview_get_window")
+		pSetTitle = loadSymbol(libHandle, "webview_set_title")
+		pSetSize = loadSymbol(libHandle, "webview_set_size")
+		pNavigate = loadSymbol(libHandle, "webview_navigate")
+		pSetHtml = loadSymbol(libHandle, "webview_set_html")
+		pInit = loadSymbol(libHandle, "webview_init")
+		pEval = loadSymbol(libHandle, "webview_eval")
+		pBind = loadSymbol(libHandle, "webview_bind")
+		pUnbind = loadSymbol(libHandle, "webview_unbind")
+		pReturn = loadSymbol(libHandle, "webview_return")
+		dispatchCallback = purego.NewCallback(dispatchCallbackFn)
+		bindingCallback = purego.NewCallback(bindingCallbackFn)
 	})
 	r1, _, _ := purego.SyscallN(pCreate, boolToInt(debug), uintptr(window))
 	if r1 == 0 {
@@ -148,13 +170,10 @@ var (
 	pReturn    uintptr
 )
 
-// Pointer for libc malloc (for context allocation).
-var cMalloc uintptr
-
 // Callback function pointers.
 var (
-	dispatchCallbackPtr uintptr
-	bindingCallbackPtr  uintptr
+	dispatchCallback uintptr
+	bindingCallback  uintptr
 )
 
 // Global state for managing dispatched functions and bound callbacks.
@@ -180,6 +199,12 @@ func (w *webview) Run() {
 }
 
 func (w *webview) Terminate() {
+	// On Windows, we need to dispatch the terminate call to the main thread.
+	// Remove once this is merged: https://github.com/webview/webview/pull/1240
+	if runtime.GOOS == "windows" {
+		w.Dispatch(func() { purego.SyscallN(pTerminate, w.handle) })
+		return
+	}
 	purego.SyscallN(pTerminate, w.handle)
 }
 
@@ -189,7 +214,7 @@ func (w *webview) Dispatch(f func()) {
 	dispatchCounter++
 	dispatchMap[idx] = f
 	dispatchMu.Unlock()
-	purego.SyscallN(pDispatch, w.handle, dispatchCallbackPtr, idx)
+	purego.SyscallN(pDispatch, w.handle, dispatchCallback, idx)
 }
 
 func (w *webview) Destroy() {
@@ -235,93 +260,26 @@ func (w *webview) Eval(js string) {
 	runtime.KeepAlive(cs)
 }
 
-//nolint:gocognit,cyclop,funlen
 func (w *webview) Bind(name string, f any) error {
-	v := reflect.ValueOf(f)
-	if v.Kind() != reflect.Func {
-		return errors.New("only functions can be bound")
+	fn, err := makeFuncWrapper(f)
+	if err != nil {
+		return err
 	}
-	if outCount := v.Type().NumOut(); outCount > 2 {
-		return errors.New("function may only return a value or a value+error")
-	}
+
 	bindMu.Lock()
 	if _, exists := boundNames[name]; exists {
 		bindMu.Unlock()
-		return errors.New("webview: function name already bound")
+		return errors.New("function name already bound")
 	}
-	// Create a wrapper that decodes JSON and calls the Go function.
-	funcType := v.Type()
-	wrapper := func(id, req string) (any, error) {
-		var rawArgs []json.RawMessage
-		if err := json.Unmarshal([]byte(req), &rawArgs); err != nil {
-			return nil, err
-		}
-		isVariadic := funcType.IsVariadic()
-		numIn := funcType.NumIn()
-		if (!isVariadic && len(rawArgs) != numIn) || (isVariadic && len(rawArgs) < numIn-1) {
-			return nil, errors.New("function arguments mismatch")
-		}
-		args := make([]reflect.Value, len(rawArgs))
-		for i := range rawArgs {
-			var argVal reflect.Value
-			if isVariadic && i >= numIn-1 {
-				argVal = reflect.New(funcType.In(numIn - 1).Elem())
-			} else {
-				argVal = reflect.New(funcType.In(i))
-			}
-			if err := json.Unmarshal(rawArgs[i], argVal.Interface()); err != nil {
-				return nil, err
-			}
-			args[i] = argVal.Elem()
-		}
-		results := v.Call(args)
-		// Handle function results (value, error) combinations
-		var ret any
-		var err error
-		switch outCount := v.Type().NumOut(); outCount {
-		case 0:
-			ret, err = nil, nil
-		case 1:
-			if funcType.Out(0).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
-				// Only error returned
-				if resErr := results[0].Interface(); resErr != nil {
-					err = resErr.(error)
-				}
-				ret = nil
-			} else {
-				// Only value returned
-				ret = results[0].Interface()
-				err = nil
-			}
-		case 2:
-			// Value and error returned
-			if results[1].Interface() != nil {
-				err = results[1].Interface().(error)
-			}
-			ret = results[0].Interface()
-		}
-		return ret, err
-	}
-	// Use allocated context pointer if available, otherwise fallback to index key
-	var contextKey uintptr
-	if cMalloc != 0 {
-		size := unsafe.Sizeof(uintptr(0)) * 2
-		r1, _, _ := purego.SyscallN(cMalloc, size)
-		if r1 == 0 {
-			bindMu.Unlock()
-			return errors.New("webview: failed to allocate context")
-		}
-		contextKey = r1
-	} else {
-		contextKey = bindingCounter
-		bindingCounter++
-	}
-	bindingMap[contextKey] = bindingEntry{w: w.handle, fn: wrapper}
+	contextKey := bindingCounter
+	bindingCounter++
+	bindingMap[contextKey] = bindingEntry{w: w.handle, fn: fn}
 	boundNames[name] = contextKey
 	bindMu.Unlock()
-	cs, namePtr := cString(name)
-	purego.SyscallN(pBind, w.handle, namePtr, bindingCallbackPtr, contextKey)
-	runtime.KeepAlive(cs)
+
+	nameBytes, namePtr := cString(name)
+	purego.SyscallN(pBind, w.handle, namePtr, bindingCallback, contextKey)
+	runtime.KeepAlive(nameBytes)
 	return nil
 }
 
@@ -330,7 +288,7 @@ func (w *webview) Unbind(name string) error {
 	contextKey, exists := boundNames[name]
 	if !exists {
 		bindMu.Unlock()
-		return errors.New("webview: function name not bound")
+		return errors.New("function name not bound")
 	}
 	delete(boundNames, name)
 	delete(bindingMap, contextKey)
@@ -341,8 +299,90 @@ func (w *webview) Unbind(name string) error {
 	return nil
 }
 
-// dispatchCallback executes a function posted with Dispatch on the main thread.
-func dispatchCallback(_, arg uintptr) uintptr {
+var errorType = reflect.TypeOf((*error)(nil)).Elem()
+
+// makeFuncWrapper inspects a user-supplied function "f" via reflection once,
+// validating its signature and caching the relevant details.
+// It returns a closure that, given (id, req string),
+// decodes JSON args, calls the underlying function, and returns (value, error).
+//
+//nolint:cyclop,funlen
+func makeFuncWrapper(f any) (func(id, req string) (any, error), error) {
+	v := reflect.ValueOf(f)
+	if v.Kind() != reflect.Func {
+		return nil, errors.New("only functions can be bound")
+	}
+
+	funcType := v.Type()
+	outCount := funcType.NumOut()
+	if outCount > 2 {
+		return nil, errors.New("function may only return a value or value+error")
+	}
+
+	numIn := funcType.NumIn()
+	isVariadic := funcType.IsVariadic()
+	inTypes := make([]reflect.Type, numIn)
+	for i := 0; i < numIn; i++ {
+		inTypes[i] = funcType.In(i)
+	}
+
+	var returnsError bool
+	switch outCount {
+	case 1:
+		if funcType.Out(0).Implements(errorType) {
+			returnsError = true
+		}
+	case 2:
+		if !funcType.Out(1).Implements(errorType) {
+			return nil, errors.New("second return value must implement error")
+		}
+	}
+
+	fn := func(id, req string) (any, error) {
+		var rawArgs []json.RawMessage
+		if err := json.Unmarshal([]byte(req), &rawArgs); err != nil {
+			return nil, err
+		}
+		if (!isVariadic && len(rawArgs) != numIn) || (isVariadic && len(rawArgs) < numIn-1) {
+			return nil, errors.New("function arguments mismatch")
+		}
+
+		args := make([]reflect.Value, len(rawArgs))
+		for i := range rawArgs {
+			var argVal reflect.Value
+			if isVariadic && i >= numIn-1 {
+				argVal = reflect.New(inTypes[numIn-1].Elem())
+			} else {
+				argVal = reflect.New(inTypes[i])
+			}
+			if err := json.Unmarshal(rawArgs[i], argVal.Interface()); err != nil {
+				return nil, err
+			}
+			args[i] = argVal.Elem()
+		}
+
+		res := v.Call(args)
+
+		switch outCount {
+		case 0:
+			return nil, nil //nolint:nilnil
+		case 1:
+			if returnsError {
+				return nil, res[0].Interface().(error)
+			}
+			return res[0].Interface(), nil
+		case 2:
+			return res[0].Interface(), res[1].Interface().(error)
+		default:
+			panic("unreachable")
+		}
+	}
+
+	return fn, nil
+}
+
+// dispatchCallbackFn executes a function posted with Dispatch on the main thread.
+func dispatchCallbackFn(_, arg uintptr) uintptr {
 	dispatchMu.Lock()
 	fn := dispatchMap[arg]
 	delete(dispatchMap, arg)
@@ -353,43 +393,55 @@ func dispatchCallback(_, arg uintptr) uintptr {
 	return 0
 }
 
-// bindingCallback is invoked by the native webview when a bound JS function is called.
-func bindingCallback(idPtr, reqPtr, arg uintptr) uintptr {
+// bindingCallbackFn is invoked by the native webview when a bound JS function is called.
+func bindingCallbackFn(idPtr, reqPtr, arg uintptr) uintptr {
 	bindMu.Lock()
 	entry, ok := bindingMap[arg]
 	bindMu.Unlock()
 	if !ok {
 		return 0
 	}
+
 	id := goString(idPtr)
 	req := goString(reqPtr)
-	resultValue, err := entry.fn(id, req)
-	status := 0
-	var resultJSON string
-	if err != nil { //nolint:nestif
-		status = -1
-		errMsg := err.Error()
-		if data, e := json.Marshal(errMsg); e == nil {
-			resultJSON = string(data)
-		} else {
-			resultJSON = "\"" + errMsg + "\""
-		}
-	} else {
-		if data, e := json.Marshal(resultValue); e == nil {
-			resultJSON = string(data)
-		} else {
+
+	go func() {
+		resultValue, err := entry.fn(id, req)
+		status := 0
+		var resultJSON string
+		if err != nil { //nolint:nestif
 			status = -1
-			msg := e.Error()
-			if data, e2 := json.Marshal(msg); e2 == nil {
+			errMsg := err.Error()
+			// Attempt to JSON-encode the error message
+			if data, e := json.Marshal(errMsg); e == nil {
 				resultJSON = string(data)
 			} else {
-				resultJSON = "\"" + msg + "\""
+				resultJSON = "\"" + errMsg + "\""
+			}
+		} else {
+			// Attempt to JSON-encode the result value
+			if data, e := json.Marshal(resultValue); e == nil {
+				resultJSON = string(data)
+			} else {
+				status = -1
+				msg := e.Error()
+				// Fallback JSON-encode for the error
+				if data2, e2 := json.Marshal(msg); e2 == nil {
+					resultJSON = string(data2)
+				} else {
+					resultJSON = "\"" + msg + "\""
+				}
 			}
 		}
-	}
-	cs, resultPtr := cString(resultJSON)
-	purego.SyscallN(pReturn, entry.w, idPtr, uintptr(status), resultPtr)
-	runtime.KeepAlive(cs)
+
+		// Create new C string for the ID as the original one is no longer valid.
+		idBytes, newIDPtr := cString(id)
+		resBytes, newResPtr := cString(resultJSON)
+		purego.SyscallN(pReturn, entry.w, newIDPtr, uintptr(status), newResPtr)
+		runtime.KeepAlive(idBytes)
+		runtime.KeepAlive(resBytes)
+	}()
+
 	return 0
 }
 
