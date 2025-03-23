@@ -109,7 +109,11 @@ func New(debug bool) WebView { return NewWindow(debug, nil) }
 // Depending on the platform, a GtkWindow, NSWindow or HWND pointer can be passed
 // here.
 func NewWindow(debug bool, window unsafe.Pointer) WebView {
-	load()
+	loadOnce.Do(func() {
+		load()
+		dispatchCallbackPtr = purego.NewCallback(dispatchCallback)
+		bindingCallbackPtr = purego.NewCallback(bindingCallback)
+	})
 	r1, _, _ := purego.SyscallN(pCreate, boolToInt(debug), uintptr(window))
 	if r1 == 0 {
 		panic("webview: failed to create window")
@@ -350,14 +354,14 @@ func dispatchCallback(_, arg uintptr) uintptr {
 }
 
 // bindingCallback is invoked by the native webview when a bound JS function is called.
-func bindingCallback(seqPtr, reqPtr, arg uintptr) uintptr {
+func bindingCallback(idPtr, reqPtr, arg uintptr) uintptr {
 	bindMu.Lock()
 	entry, ok := bindingMap[arg]
 	bindMu.Unlock()
 	if !ok {
 		return 0
 	}
-	id := goString(seqPtr)
+	id := goString(idPtr)
 	req := goString(reqPtr)
 	resultValue, err := entry.fn(id, req)
 	status := 0
@@ -384,7 +388,7 @@ func bindingCallback(seqPtr, reqPtr, arg uintptr) uintptr {
 		}
 	}
 	cs, resultPtr := cString(resultJSON)
-	purego.SyscallN(pReturn, entry.w, seqPtr, uintptr(status), resultPtr)
+	purego.SyscallN(pReturn, entry.w, idPtr, uintptr(status), resultPtr)
 	runtime.KeepAlive(cs)
 	return 0
 }

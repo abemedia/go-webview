@@ -1,15 +1,15 @@
 package main
 
 import (
-	"github.com/abemedia/webview"
-	_ "github.com/abemedia/webview/embedded"
+	"github.com/abemedia/go-webview"
+	_ "github.com/abemedia/go-webview/embedded"
 )
 
 func main() {
 	w := webview.New(true)
-	w.SetTitle("Hello")
-	w.SetSize(800, 600, webview.HintNone)
-	w.Navigate("https://google.com")
+	w.SetTitle("Basic Example")
+	w.SetSize(480, 320, webview.HintNone)
+	w.SetHtml("Thanks for using webview!")
 	w.Run()
 	w.Destroy()
 }

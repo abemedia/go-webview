@@ -1,56 +1,59 @@
 package webview_test
 
 import (
-	"os"
 	"runtime"
 	"testing"
+	"time"
 
-	"github.com/abemedia/webview"
-	_ "github.com/abemedia/webview/embedded"
-	"golang.design/x/mainthread"
+	"github.com/abemedia/go-webview"
+	_ "github.com/abemedia/go-webview/embedded"
 )
 
 // Needed to ensure that the tests run on the main thread.
-func TestMain(m *testing.M) {
-	mainthread.Init(func() {
-		os.Exit(m.Run())
-	})
+func init() {
+	runtime.UnlockOSThread()
 }
 
 func TestWebview(t *testing.T) {
-	mainthread.Call(func() {
-		var got bool
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 
-		w := webview.New(false)
-		w.SetTitle("Hello")
-		w.SetSize(800, 600, webview.HintNone)
-		w.SetHtml(`<!doctype html>
+	run := make(chan bool, 1)
+
+	w := webview.New(true)
+	w.SetTitle("Hello")
+	w.SetSize(800, 600, webview.HintNone)
+
+	err := w.Bind("run", func(b bool) {
+		run <- b
+		w.Terminate()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w.SetHtml(`<!doctype html>
 		<html>
 			<script>
-				window.onload = function() { run(); };
+				window.onload = function() { run(true); };
 			</script>
 		</html>`)
+	w.Init("console.log('init');")
 
-		err := w.Bind("run", func() {
-			got = true
-			if runtime.GOOS == "windows" {
-				w.Dispatch(w.Terminate)
-				w.Dispatch(w.Destroy)
-			} else {
-				w.Terminate()
-			}
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-
+	if runtime.GOOS == "windows" {
+		w.Dispatch(w.Run)
+	} else {
 		w.Run()
-		if runtime.GOOS != "windows" {
-			w.Destroy()
-		}
+	}
 
-		if !got {
-			t.Fatal("got is false; want true")
+	select {
+	case ok := <-run:
+		if !ok {
+			t.Fatal("run failed")
 		}
-	})
+	case <-time.After(time.Minute):
+		t.Fatal("timeout")
+	}
+
+	w.Destroy()
 }
