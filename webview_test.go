@@ -38,13 +38,9 @@ func TestWebview(t *testing.T) {
 				window.onload = function() { run(true); };
 			</script>
 		</html>`)
-	w.Init("console.log('init');")
 
-	if runtime.GOOS == "windows" {
-		w.Dispatch(w.Run)
-	} else {
-		w.Run()
-	}
+	w.Run()
+	w.Destroy()
 
 	select {
 	case ok := <-run:
@@ -54,6 +50,4 @@ func TestWebview(t *testing.T) {
 	case <-time.After(time.Minute):
 		t.Fatal("timeout")
 	}
-
-	w.Destroy()
 }
