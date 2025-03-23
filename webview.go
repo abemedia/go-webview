@@ -7,7 +7,6 @@ import (
 	"reflect"
 	"runtime"
 	"sync"
-	"syscall"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -19,7 +18,7 @@ func init() {
 }
 
 // Hints are used to configure window sizing and resizing.
-type Hint int
+type Hint uintptr
 
 const (
 	// Width and height are default size.
@@ -111,19 +110,41 @@ func New(debug bool) WebView { return NewWindow(debug, nil) }
 // here.
 func NewWindow(debug bool, window unsafe.Pointer) WebView {
 	load()
-	r1, _, err := purego.SyscallN(pCreate, boolToInt(debug), uintptr(window))
-	if err != 0 {
-		panic("webview: failed to create window: " + syscall.Errno(err).Error())
-	}
-	if r1 == 0 {
+	w := webviewCreate(debug, window)
+	if w == nil {
 		panic("webview: failed to create window")
 	}
-	return &webview{handle: r1}
+	return &webview{w: w}
+}
+
+type webviewError int
+
+func (e webviewError) Error() string {
+	switch e {
+	case -5:
+		return "missing dependency"
+	case -4:
+		return "operation canceled"
+	case -3:
+		return "invalid state"
+	case -2:
+		return "invalid argument"
+	case -1:
+		return "unspecified error"
+	case 0:
+		return "no error"
+	case 1:
+		return "duplicate"
+	case 2:
+		return "not found"
+	default:
+		return "unknown error"
+	}
 }
 
 // webview is a concrete implementation of WebView using native library calls.
 type webview struct {
-	handle uintptr
+	w unsafe.Pointer
 }
 
 // Global once to load native library symbols.
@@ -131,21 +152,21 @@ var loadOnce sync.Once
 
 // Function pointers for native library functions.
 var (
-	pCreate    uintptr
-	pDestroy   uintptr
-	pRun       uintptr
-	pTerminate uintptr
-	pDispatch  uintptr
-	pGetWindow uintptr
-	pSetTitle  uintptr
-	pSetSize   uintptr
-	pNavigate  uintptr
-	pSetHtml   uintptr
-	pInit      uintptr
-	pEval      uintptr
-	pBind      uintptr
-	pUnbind    uintptr
-	pReturn    uintptr
+	webviewCreate    func(debug bool, window unsafe.Pointer) unsafe.Pointer
+	webviewDestroy   func(window unsafe.Pointer)
+	webviewRun       func(window unsafe.Pointer)
+	webviewTerminate func(window unsafe.Pointer)
+	webviewDispatch  func(window unsafe.Pointer, fn, arg uintptr)
+	webviewGetWindow func(window unsafe.Pointer) unsafe.Pointer
+	webviewSetTitle  func(window unsafe.Pointer, title string) webviewError
+	webviewSetSize   func(webview unsafe.Pointer, width, height, hints int32) webviewError
+	webviewNavigate  func(window unsafe.Pointer, url string) webviewError
+	webviewSetHtml   func(window unsafe.Pointer, html string) webviewError
+	webviewInit      func(window unsafe.Pointer, js string) webviewError
+	webviewEval      func(window unsafe.Pointer, js string) webviewError
+	webviewBind      func(window unsafe.Pointer, name string, fn, arg uintptr) webviewError
+	webviewUnbind    func(window unsafe.Pointer, name string) webviewError
+	webviewReturn    func(window unsafe.Pointer, id string, status int, result string) webviewError
 )
 
 // Pointer for libc malloc (for context allocation).
@@ -172,15 +193,15 @@ var (
 // bindingEntry stores a bound callback and associated webview handle.
 type bindingEntry struct {
 	fn func(id, req string) (any, error)
-	w  uintptr
+	w  unsafe.Pointer
 }
 
 func (w *webview) Run() {
-	purego.SyscallN(pRun, w.handle)
+	webviewRun(w.w)
 }
 
 func (w *webview) Terminate() {
-	purego.SyscallN(pTerminate, w.handle)
+	webviewTerminate(w.w)
 }
 
 func (w *webview) Dispatch(f func()) {
@@ -189,50 +210,57 @@ func (w *webview) Dispatch(f func()) {
 	dispatchCounter++
 	dispatchMap[idx] = f
 	dispatchMu.Unlock()
-	purego.SyscallN(pDispatch, w.handle, dispatchCallbackPtr, idx)
+	webviewDispatch(w.w, dispatchCallbackPtr, idx)
 }
 
 func (w *webview) Destroy() {
-	purego.SyscallN(pDestroy, w.handle)
+	webviewDestroy(w.w)
 }
 
 func (w *webview) Window() unsafe.Pointer {
-	r1, _, _ := purego.SyscallN(pGetWindow, w.handle)
-	return unsafe.Pointer(r1)
+	return webviewGetWindow(w.w)
 }
 
 func (w *webview) SetTitle(title string) {
-	cs, ptr := goStringToCString(title)
-	purego.SyscallN(pSetTitle, w.handle, ptr)
-	runtime.KeepAlive(cs)
+	err := webviewSetTitle(w.w, title)
+	if err != 0 {
+		panic(err)
+	}
 }
 
 func (w *webview) SetSize(width, height int, hint Hint) {
-	purego.SyscallN(pSetSize, w.handle, uintptr(width), uintptr(height), uintptr(hint))
+	err := webviewSetSize(w.w, int32(width), int32(height), int32(hint))
+	if err != 0 {
+		panic(err)
+	}
 }
 
 func (w *webview) Navigate(url string) {
-	cs, ptr := goStringToCString(url)
-	purego.SyscallN(pNavigate, w.handle, ptr)
-	runtime.KeepAlive(cs)
+	err := webviewNavigate(w.w, url)
+	if err != 0 {
+		panic(err)
+	}
 }
 
 func (w *webview) SetHtml(html string) {
-	cs, ptr := goStringToCString(html)
-	purego.SyscallN(pSetHtml, w.handle, ptr)
-	runtime.KeepAlive(cs)
+	err := webviewSetHtml(w.w, html)
+	if err != 0 {
+		panic(err)
+	}
 }
 
 func (w *webview) Init(js string) {
-	cs, ptr := goStringToCString(js)
-	purego.SyscallN(pInit, w.handle, ptr)
-	runtime.KeepAlive(cs)
+	err := webviewInit(w.w, js)
+	if err != 0 {
+		panic(err)
+	}
 }
 
 func (w *webview) Eval(js string) {
-	cs, ptr := goStringToCString(js)
-	purego.SyscallN(pEval, w.handle, ptr)
-	runtime.KeepAlive(cs)
+	err := webviewEval(w.w, js)
+	if err != 0 {
+		panic(err)
+	}
 }
 
 //nolint:gocognit,cyclop,funlen
@@ -316,12 +344,13 @@ func (w *webview) Bind(name string, f any) error {
 		contextKey = bindingCounter
 		bindingCounter++
 	}
-	bindingMap[contextKey] = bindingEntry{w: w.handle, fn: wrapper}
+	bindingMap[contextKey] = bindingEntry{w: w.w, fn: wrapper}
 	boundNames[name] = contextKey
 	bindMu.Unlock()
-	cs, namePtr := goStringToCString(name)
-	purego.SyscallN(pBind, w.handle, namePtr, bindingCallbackPtr, contextKey)
-	runtime.KeepAlive(cs)
+	err := webviewBind(w.w, name, bindingCallbackPtr, contextKey)
+	if err != 0 {
+		return err
+	}
 	return nil
 }
 
@@ -335,14 +364,15 @@ func (w *webview) Unbind(name string) error {
 	delete(boundNames, name)
 	delete(bindingMap, contextKey)
 	bindMu.Unlock()
-	cs, namePtr := goStringToCString(name)
-	purego.SyscallN(pUnbind, w.handle, namePtr)
-	runtime.KeepAlive(cs)
+	err := webviewUnbind(w.w, name)
+	if err != 0 {
+		return err
+	}
 	return nil
 }
 
 // dispatchCallback executes a function posted with Dispatch on the main thread.
-func dispatchCallback(_, arg uintptr) uintptr {
+func dispatchCallback(_ unsafe.Pointer, arg uintptr) uintptr {
 	dispatchMu.Lock()
 	fn := dispatchMap[arg]
 	delete(dispatchMap, arg)
@@ -387,22 +417,8 @@ func bindingCallback(seqPtr, reqPtr, arg uintptr) uintptr {
 			}
 		}
 	}
-	cs, resultPtr := goStringToCString(resultJSON)
-	purego.SyscallN(pReturn, entry.w, seqPtr, uintptr(status), resultPtr)
-	runtime.KeepAlive(cs)
+	webviewReturn(entry.w, id, status, resultJSON)
 	return 0
-}
-
-func boolToInt(b bool) uintptr {
-	if b {
-		return 1
-	}
-	return 0
-}
-
-func goStringToCString(s string) ([]byte, uintptr) {
-	b := append([]byte(s), 0)
-	return b, uintptr(unsafe.Pointer(&b[0]))
 }
 
 func cStringToGo(ptr uintptr) string {

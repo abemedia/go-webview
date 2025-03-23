@@ -14,19 +14,21 @@ import (
 
 func load() {
 	loadOnce.Do(func() {
-		var name string
+		var fname string
 		var paths []string
 		execPath, _ := os.Executable()
 		execDir := filepath.Dir(execPath)
 		switch runtime.GOOS {
+		case "windows":
+			fname = "webview.dll"
 		case "linux":
-			name = "libwebview.so"
+			fname = "libwebview.so"
 			paths = []string{
 				os.Getenv("WEBVIEW_PATH"),
 				execDir,
 			}
 		case "darwin":
-			name = "libwebview.dylib"
+			fname = "libwebview.dylib"
 			paths = []string{
 				os.Getenv("WEBVIEW_PATH"),
 				execDir,
@@ -34,9 +36,8 @@ func load() {
 			}
 		}
 
-		fname := "libwebview.dylib"
 		for _, v := range paths {
-			fn := filepath.Join(v, name)
+			fn := filepath.Join(v, fname)
 			if _, err := os.Stat(fn); err == nil {
 				fname = fn
 				break
@@ -51,21 +52,21 @@ func load() {
 			panic("webview: native library not loaded")
 		}
 		// Resolve all required symbols from the library
-		pCreate = mustLoadSymbol(libHandle, "webview_create")
-		pDestroy = mustLoadSymbol(libHandle, "webview_destroy")
-		pRun = mustLoadSymbol(libHandle, "webview_run")
-		pTerminate = mustLoadSymbol(libHandle, "webview_terminate")
-		pDispatch = mustLoadSymbol(libHandle, "webview_dispatch")
-		pGetWindow = mustLoadSymbol(libHandle, "webview_get_window")
-		pSetTitle = mustLoadSymbol(libHandle, "webview_set_title")
-		pSetSize = mustLoadSymbol(libHandle, "webview_set_size")
-		pNavigate = mustLoadSymbol(libHandle, "webview_navigate")
-		pSetHtml = mustLoadSymbol(libHandle, "webview_set_html")
-		pInit = mustLoadSymbol(libHandle, "webview_init")
-		pEval = mustLoadSymbol(libHandle, "webview_eval")
-		pBind = mustLoadSymbol(libHandle, "webview_bind")
-		pUnbind = mustLoadSymbol(libHandle, "webview_unbind")
-		pReturn = mustLoadSymbol(libHandle, "webview_return")
+		purego.RegisterLibFunc(&webviewCreate, libHandle, "webview_create")
+		purego.RegisterLibFunc(&webviewDestroy, libHandle, "webview_destroy")
+		purego.RegisterLibFunc(&webviewRun, libHandle, "webview_run")
+		purego.RegisterLibFunc(&webviewTerminate, libHandle, "webview_terminate")
+		purego.RegisterLibFunc(&webviewGetWindow, libHandle, "webview_get_window")
+		purego.RegisterLibFunc(&webviewNavigate, libHandle, "webview_navigate")
+		purego.RegisterLibFunc(&webviewSetTitle, libHandle, "webview_set_title")
+		purego.RegisterLibFunc(&webviewSetHtml, libHandle, "webview_dispatch")
+		purego.RegisterLibFunc(&webviewDispatch, libHandle, "webview_dispatch")
+		purego.RegisterLibFunc(&webviewSetSize, libHandle, "webview_set_size")
+		purego.RegisterLibFunc(&webviewInit, libHandle, "webview_init")
+		purego.RegisterLibFunc(&webviewEval, libHandle, "webview_eval")
+		purego.RegisterLibFunc(&webviewBind, libHandle, "webview_bind")
+		purego.RegisterLibFunc(&webviewUnbind, libHandle, "webview_unbind")
+		purego.RegisterLibFunc(&webviewReturn, libHandle, "webview_return")
 
 		// Attempt to load standard malloc/free for context allocation
 		cMalloc, _ = purego.Dlsym(purego.RTLD_DEFAULT, "malloc")
@@ -74,13 +75,4 @@ func load() {
 		dispatchCallbackPtr = purego.NewCallback(dispatchCallback)
 		bindingCallbackPtr = purego.NewCallback(bindingCallback)
 	})
-}
-
-// mustLoadSymbol looks up a symbol and panics if not found.
-func mustLoadSymbol(lib uintptr, name string) uintptr {
-	ptr, err := purego.Dlsym(lib, name)
-	if err != nil || ptr == 0 {
-		panic("webview: failed to load symbol " + name + ": " + err.Error())
-	}
-	return ptr
 }
