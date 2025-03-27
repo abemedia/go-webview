@@ -2,7 +2,7 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/abemedia/go-webview.svg)](https://pkg.go.dev/github.com/abemedia/go-webview)
 [![CI](https://github.com/abemedia/go-webview/actions/workflows/test.yml/badge.svg)](https://github.com/abemedia/go-webview/actions/workflows/test.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/abemedia/go-don)](https://goreportcard.com/report/github.com/abemedia/go-don)
+[![Go Report Card](https://goreportcard.com/badge/github.com/abemedia/go-webview)](https://goreportcard.com/report/github.com/abemedia/go-webview)
 
 Go bindings for [webview/webview](https://github.com/webview/webview) using [purego](https://github.com/ebitengine/purego), with **no CGO**, and prebuilt native libraries for Windows, macOS, and Linux.
 
